@@ -1,0 +1,11 @@
+//go:build darwin && arm64 && !embed_pomerium && !debug_local_envoy
+
+package files
+
+import _ "embed" // embed
+
+//go:embed envoy-darwin-arm64
+var rawBinary []byte
+
+//go:embed envoy-darwin-arm64.lock
+var rawLockfile []byte

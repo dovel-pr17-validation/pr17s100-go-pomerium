@@ -1,0 +1,209 @@
+# Setup name variables for the package/tool
+PREFIX?=$(shell pwd)
+
+NAME := pomerium
+PKG := github.com/pomerium/pomerium
+
+BUILDDIR := ${PREFIX}/dist
+BINDIR := ${PREFIX}/bin
+# Set any default go build tags
+BUILDTAGS :=
+
+# Populate version variables
+# Add to compile time flags
+VERSION ?= $(shell git describe --tags)
+GITCOMMIT := $(shell git rev-parse --short HEAD)
+BUILDMETA :=
+GITUNTRACKEDCHANGES := $(shell git status --porcelain --untracked-files=no)
+ifneq ($(GITUNTRACKEDCHANGES),)
+	BUILDMETA := dirty
+endif
+CTIMEVAR = \
+	-X $(PKG)/internal/version.GitCommit=$(GITCOMMIT) \
+	-X $(PKG)/internal/version.Version=$(VERSION) \
+	-X $(PKG)/internal/version.BuildMeta=$(BUILDMETA) \
+	-X $(PKG)/internal/version.ProjectName=$(NAME) \
+	-X $(PKG)/internal/version.ProjectURL=$(PKG)
+
+GO ?= "go"
+GO_LDFLAGS = -ldflags "-s -w $(CTIMEVAR)"
+GOOS = $(shell $(GO) env GOOS)
+GOARCH = $(shell $(GO) env GOARCH)
+GORELEASER_VERSION = v$(shell grep '^goreleaser ' .tool-versions | awk '{print $$2}')
+GO_TESTFLAGS := -race
+# disable the race detector in macos
+ifeq ($(shell env -u GOOS $(GO) env GOOS), darwin)
+	GO_TESTFLAGS :=
+	export POMERIUM_SOCKET_DIRECTORY := /tmp
+endif
+ENVOY_OCI_REPO ?= "ghcr.io/pomerium/envoy-custom"
+GET_ENVOY_DEBUG :=
+
+.PHONY: all
+all: clean deps-build test lint build ## Runs a clean, build, fmt, lint, test, and vet.
+
+.PHONY: setup-merge-driver
+setup-merge-driver: ## Configure git merge driver for components.json (run once after cloning)
+	@echo "==> $@"
+	@git config merge.components-json.driver 'scripts/merge-components-json %O %A %B'
+	@git config merge.components-json.name 'Merge components.json by picking highest semver'
+	@echo "Git merge driver configured for internal/version/components.json"
+
+.PHONY: check-component-versions
+check-component-versions:
+	@echo "==> $@"
+	@scripts/check-component-versions
+
+.PHONY: get-envoy
+get-envoy: ## Fetch envoy binaries
+	@echo "==> $@"
+	@cd pkg/envoy/files && env -u GOOS -u GOARCH $(GO) run ../get-envoy --repo $(ENVOY_OCI_REPO) $(if $(GET_ENVOY_DEBUG),--debug,)
+
+.PHONY: deps-build
+deps-build: get-envoy ## Install build dependencies
+	@echo "==> $@"
+
+.PHONY: proto-before
+proto-before:
+	@echo "==> $@"
+	cd pkg/grpc && ./protoc.bash
+
+.PHONY: proto-after
+proto-after: generate-code
+	@echo "==> $@"
+
+.PHONY: proto
+proto: proto-before proto-after
+	@echo "==> $@"
+
+.PHONY: generate
+generate: proto
+	@echo "==> $@"
+	$(GO) generate ./...
+
+.PHONY: generate-code
+generate-code:
+	@echo "==> $@"
+	$(GO) run ./internal/generate
+
+.PHONY: build
+build: build-ui build-go
+	@echo "==> $@"
+
+.PHONY: build-debug
+build-debug: deps-build ## Builds binaries appropriate for debugging
+	@echo "==> $@"
+	@CGO_ENABLED=0 $(GO) build -gcflags="all=-N -l" -o $(BINDIR)/$(NAME) ./cmd/"$(NAME)"
+
+.PHONY: build-go
+build-go: deps-build
+	@echo "==> $@"
+	@CGO_ENABLED=0 $(GO) build -tags "$(BUILDTAGS)" ${GO_LDFLAGS} -o $(BINDIR)/$(NAME) ./cmd/"$(NAME)"
+
+DEBUG_LOCAL_ENVOY_PATH ?=
+build-local: build-ui # Builds pomerium core with a local envoy build
+	@echo "==> $@"
+	@echo "${DEBUG_LOCAL_ENVOY_PATH}"
+	@CGO_ENABLED=0 $(GO) build -tags "debug_local_envoy $(BUILDTAGS)" -ldflags "-s -w $(CTIMEVAR) -X $(PKG)/pkg/envoy.DebugLocalEnvoyPath=$(DEBUG_LOCAL_ENVOY_PATH)" -o $(BINDIR)/$(NAME) ./cmd/"$(NAME)"
+
+.PHONY: build-ui
+build-ui: npm-install
+	@echo "==> $@"
+	@cd ui; npm run build
+
+.PHONY: go-fix
+go-fix: deps-build
+	@echo "==> $@"
+	$(GO) fix ./...
+
+.PHONY: docker
+docker: build-ui ## Builds the local root image through the release Dockerfile.
+	@echo "==> $@"
+	@set -eu; \
+		_temp_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/pomerium-debug.XXXXXX")"; \
+		trap 'rm -rf "$$_temp_dir"' EXIT INT TERM; \
+		GOOS=linux $(MAKE) build-go; \
+		cp "$(BINDIR)/$(NAME)" "$$_temp_dir/pomerium"; \
+		docker build -t pomerium/pomerium:local -f .github/Dockerfile-release "$$_temp_dir"
+
+.PHONY: docker-debug
+docker-debug: build-ui ## Builds the local root debug image through the release debug Dockerfile.
+	@echo "==> $@"
+	@set -eu; \
+		_temp_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/pomerium-debug.XXXXXX")"; \
+		trap 'rm -rf "$$_temp_dir"' EXIT INT TERM; \
+		GOOS=linux $(MAKE) build-go; \
+		cp "$(BINDIR)/$(NAME)" "$$_temp_dir/pomerium"; \
+		docker build -t pomerium/pomerium:debug-local -f .github/Dockerfile-release-debug "$$_temp_dir"
+
+.PHONY: lint
+lint:
+	@echo "==> $@"
+	$(GO) run ./pkg/tools/get-tools.go && \
+	./bin/golangci-lint run --fix --timeout=10m ./...
+
+.PHONY: govulncheck
+govulncheck: ## Scan for known Go vulnerabilities (all workspace modules)
+	@echo "==> $@"
+	@for dir in $$($(GO) list -m -f '{{.Dir}}'); do \
+		echo "==> govulncheck $$dir"; \
+		( cd "$$dir" && $(GO) run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./... ) || exit 1; \
+	done
+
+.PHONY: test
+test: get-envoy ## Runs the go tests.
+	@echo "==> $@"
+	$(GO) test $(GO_TESTFLAGS) -tags "$(BUILDTAGS)" ./...
+
+# End-to-end tests are heavyweight (Docker via testcontainers, in-process
+# Pomerium via testenv) and each mutates process-global state (e.g. the OTel
+# tracer), so they must run one at a time in their own process. Each is gated
+# behind a per-test RUN_<TestName> env var and has its own sub-target so they
+# never share a process; test-e2e chains them.
+.PHONY: test-e2e
+test-e2e: test-e2e-k3s ## Runs all e2e tests, each isolated in its own process.
+
+.PHONY: test-e2e-k3s
+test-e2e-k3s: get-envoy ## Runs the k3s external-JWT e2e test (requires Docker).
+	@echo "==> $@"
+	RUN_TestExternalJWTBearer_K3s=1 $(GO) test -timeout=15m -run '^TestExternalJWTBearer_K3s$$' ./authorize/...
+
+.PHONY: cover
+cover: get-envoy ## Runs go test with coverage
+	@echo "==> $@"
+	$(GO) test $(GO_TESTFLAGS) -tags "$(BUILDTAGS)" -coverprofile=coverage.txt ./...
+	@sed -i.bak '/\.pb\.go\:/d' coverage.txt
+	@sed -i.bak '/\/mock_.*\.go\:/d' coverage.txt
+	@sed -i.bak '/\.gen\.go\:/d' coverage.txt
+	@sed -i.bak '/\/internal\/testenv\/:/d' coverage.txt
+	@sed -i.bak '/\/internal\/testutil\/:/d' coverage.txt
+	@sed -i.bak '/\/internal\/tests\/:/d' coverage.txt
+	@sed -i.bak '/\/storagetest\/:/d' coverage.txt
+	@sed -i.bak '/\/integration\/:/d' coverage.txt
+	@sed -i.bak '/\/examples\/:/d' coverage.txt
+	@sed -i.bak '/\/ssh\/test\/:/d' coverage.txt
+	@sort -o coverage.txt coverage.txt
+
+.PHONY: clean
+clean: ## Cleanup any build binaries or packages.
+	@echo "==> $@"
+	$(RM) -r $(BINDIR)
+	$(RM) -r $(BUILDDIR)
+	$(RM) pkg/envoy/files/envoy-*
+	$(RM) $(GOPATH)/bin/protoc-gen-validate
+	$(RM) -r /tmp/pomerium-protoc
+	$(RM) -r /tmp/pomerium-protoc-3pp
+
+.PHONY: snapshot
+snapshot: deps-build ## Builds the cross-compiled binaries, naming them in such a way for release (eg. binary-GOOS-GOARCH)
+	@echo "==> $@"
+	@$(GO) run github.com/goreleaser/goreleaser/v2@${GORELEASER_VERSION} release --clean -f .github/goreleaser.yaml --snapshot
+
+.PHONY: npm-install
+npm-install:
+	@echo "==> $@"
+	cd ui ; npm ci
+
+.PHONY: help
+help:
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'

@@ -1,0 +1,388 @@
+package authorize
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	envoy_service_auth_v3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
+	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/pomerium/pomerium/authorize/checkrequest"
+	"github.com/pomerium/pomerium/authorize/evaluator"
+	"github.com/pomerium/pomerium/config"
+	"github.com/pomerium/pomerium/config/envoyconfig"
+	"github.com/pomerium/pomerium/internal/httputil"
+	"github.com/pomerium/pomerium/internal/log"
+	"github.com/pomerium/pomerium/internal/mcp"
+	"github.com/pomerium/pomerium/internal/sessions"
+	"github.com/pomerium/pomerium/pkg/contextutil"
+	configpb "github.com/pomerium/pomerium/pkg/grpc/config"
+	"github.com/pomerium/pomerium/pkg/grpc/session"
+	"github.com/pomerium/pomerium/pkg/grpcutil"
+	"github.com/pomerium/pomerium/pkg/storage"
+	"github.com/pomerium/pomerium/pkg/telemetry/requestid"
+)
+
+// Check implements the envoy auth server gRPC endpoint.
+func (a *Authorize) Check(ctx context.Context, in *envoy_service_auth_v3.CheckRequest) (*envoy_service_auth_v3.CheckResponse, error) {
+	ctx, span := a.tracer.Start(ctx, "authorize.grpc.Check")
+	defer span.End()
+
+	ctx = a.withQuerierForCheckRequest(ctx)
+
+	state := a.state.Load()
+	mcpEnabled := a.currentConfig.Load().Options.IsRuntimeFlagSet(config.RuntimeFlagMCP)
+
+	// convert the incoming envoy-style http request into a go-style http request
+	hreq := getHTTPRequestFromCheckRequest(in)
+	requestID := requestid.FromHTTPHeader(hreq.Header)
+	ctx = requestid.WithValue(ctx, requestID)
+
+	req, err := a.getEvaluatorRequestFromCheckRequest(ctx, in)
+	if errors.Is(err, errMCPRequestBodyTooLarge) || errors.Is(err, errMCPInvalidRequest) {
+		return a.rejectMCPRequest(ctx, in, req, err)
+	} else if err != nil {
+		log.Ctx(ctx).Error().Err(err).Str("request-id", requestID).Msg("error building evaluator request")
+		return nil, err
+	}
+
+	// Add MCP information to trace if available
+	updateSpanWithMCPInfo(span, req.MCP)
+
+	// Handle CORS preflight for MCP server routes.
+	// OPTIONS requests must be answered with CORS headers before any auth
+	// checks because browsers send preflight requests without credentials.
+	if mcpEnabled && req.Policy.IsMCPServer() &&
+		in.GetAttributes().GetRequest().GetHttp().GetMethod() == http.MethodOptions {
+		headers := make(http.Header)
+		mcp.SetCORSHeaders(headers)
+		return mkDeniedCheckResponse(http.StatusNoContent, headers, ""), nil
+	}
+
+	// Cookie + Authorization: Bearer are mutually exclusive trust contexts,
+	// but only on bearer_token_format: jwt routes: cookies come from a
+	// browser, an external JWT comes from an M2M client, so a request
+	// carrying both is a misconfigured client or a confusion attempt —
+	// reject with 400. The IdP access/identity token formats predate this
+	// check and allow both credentials together (a logged-in browser may
+	// send its IdP token via Authorization; see TestBearerTokenFormat), and
+	// on pass-through routes the Authorization header belongs to the
+	// upstream, so neither may be rejected here.
+	cfg := a.currentConfig.Load()
+	if cfg.GetBearerTokenFormatForPolicy(req.Policy) == configpb.BearerTokenFormat_BEARER_TOKEN_FORMAT_JWT &&
+		hasCookieAndBearer(hreq, cfg.Options.CookieName) {
+		log.Ctx(ctx).Info().
+			Str("request-id", requestID).
+			Msg("request carried both a session cookie and an Authorization: Bearer header on a bearer_token_format:jwt route; rejecting as 400")
+		return a.deniedResponse(ctx, in, int32(http.StatusBadRequest), http.StatusText(http.StatusBadRequest), nil)
+	}
+
+	// load the session
+	s, err := a.loadSession(ctx, hreq, req)
+	if errors.Is(err, sessions.ErrInvalidSession) {
+		// ENG-2172: if this is an invalid session, don't evaluate policy, return forbidden
+		return a.deniedResponse(ctx, in, int32(http.StatusForbidden), http.StatusText(http.StatusForbidden), nil)
+	} else if err != nil {
+		return nil, fmt.Errorf("error loading session: %w", err)
+	}
+
+	if s != nil {
+		req.Session.ID = s.GetId()
+		req.Session.UserID = s.GetUserId()
+	}
+
+	res, err := state.evaluator.Evaluate(ctx, req)
+	if err != nil {
+		log.Ctx(ctx).Error().Err(err).Str("request-id", requestID).Msg("error during OPA evaluation")
+		return nil, err
+	}
+
+	// if show error details is enabled, attach the policy evaluation traces
+	if req.Policy != nil && req.Policy.ShowErrorDetails {
+		ctx = contextutil.WithPolicyEvaluationTraces(ctx, res.Traces)
+	}
+
+	resp, err := a.handleResult(ctx, in, req, res)
+	if err != nil {
+		log.Ctx(ctx).Error().Err(err).Str("request-id", requestID).Msg("grpc check ext_authz_error")
+	}
+	a.logAuthorizeCheck(ctx, zerolog.InfoLevel, req, res, s)
+	return resp, err
+}
+
+func (a *Authorize) loadSession(
+	ctx context.Context,
+	hreq *http.Request,
+	req *evaluator.Request,
+) (s sessionOrServiceAccount, err error) {
+	requestID := requestid.FromHTTPHeader(hreq.Header)
+
+	s, err = a.maybeGetSessionFromRequest(ctx, hreq, req.Policy)
+	if err == nil {
+		return s, nil
+	} else if !errors.Is(err, sessions.ErrNoSessionFound) {
+		log.Ctx(ctx).Info().
+			Str("request-id", requestID).
+			Err(err).
+			Msg("error creating session from incoming request")
+		return nil, err
+	}
+
+	h, hErr := a.state.Load().sessionStore.ReadSessionHandleAndCheckIDP(hreq)
+	if h == nil {
+		log.Ctx(ctx).Debug().
+			Str("request-id", requestID).
+			AnErr("handle-error", hErr).
+			Msg("no session handle from request")
+		return nil, nil
+	}
+
+	log.Ctx(ctx).Debug().
+		Str("request-id", requestID).
+		Str("handle-id", h.Id).
+		Str("handle-idp-id", h.IdentityProviderId).
+		Uint64("handle-record-version", h.GetDatabrokerRecordVersion()).
+		Msg("decoded session handle from request")
+
+	s, err = a.getDataBrokerSessionOrServiceAccount(ctx, h.Id, h.GetDatabrokerRecordVersion())
+	if status.Code(err) == codes.Unavailable {
+		log.Ctx(ctx).Debug().Str("request-id", requestID).Err(err).Msg("temporary error checking authorization: data broker unavailable")
+		return nil, err
+	} else if err != nil {
+		log.Ctx(ctx).Info().Err(err).Str("request-id", requestID).Msg("clearing session due to missing or invalid session or service account")
+		return nil, nil
+	}
+
+	return s, nil
+}
+
+func (a *Authorize) maybeGetSessionFromRequest(
+	ctx context.Context,
+	hreq *http.Request,
+	policy *config.Policy,
+) (*session.Session, error) {
+	if a.currentConfig.Load().Options.IsRuntimeFlagSet(config.RuntimeFlagMCP) {
+		if policy.IsMCPServer() || strings.HasPrefix(hreq.URL.Path, mcp.DefaultPrefix) {
+			s, err := a.getMCPSession(ctx, hreq)
+			if err != nil {
+				log.Ctx(ctx).Error().Err(err).Msg("error getting mcp session")
+				return nil, err
+			}
+			return s, nil
+		}
+	}
+
+	// attempt to create a session from an incoming idp token
+	return a.state.Load().idpTokenSessionCreator.
+		CreateSession(ctx, a.currentConfig.Load(), policy, hreq)
+}
+
+func (a *Authorize) getMCPSession(
+	ctx context.Context,
+	hreq *http.Request,
+) (*session.Session, error) {
+	auth := hreq.Header.Get(httputil.HeaderAuthorization)
+	if auth == "" {
+		return nil, fmt.Errorf("no authorization header was provided: %w", sessions.ErrNoSessionFound)
+	}
+
+	prefix := "Bearer "
+	if !strings.HasPrefix(strings.ToLower(auth), strings.ToLower(prefix)) {
+		return nil, fmt.Errorf("authorization header does not start with %q: %w", prefix, sessions.ErrNoSessionFound)
+	}
+
+	accessToken := auth[len(prefix):]
+	sessionID, sessionRecordVersion, err := a.state.Load().mcp.GetSessionAndVersionFromAccessToken(accessToken)
+	if err != nil {
+		return nil, fmt.Errorf("no session found for access token: %w: %w", err, sessions.ErrNoSessionFound)
+	}
+
+	// Read the session with the record version captured when the token was
+	// issued. This gives read-your-writes: if the synced-data cache is behind
+	// that version (e.g. a session just written on another databroker node), the
+	// querier falls through to an authoritative databroker read instead of
+	// reporting the session as missing and denying with a 401.
+	record, err := storage.GetDataBrokerRecord(ctx, grpcutil.GetTypeURL(new(session.Session)), sessionID, sessionRecordVersion)
+	if storage.IsNotFound(err) {
+		return nil, fmt.Errorf("session databroker record not found: %w", sessions.ErrNoSessionFound)
+	}
+
+	msg, err := record.GetData().UnmarshalNew()
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling session: %w: %w", err, sessions.ErrNoSessionFound)
+	}
+
+	s, ok := msg.(*session.Session)
+	if !ok {
+		return nil, fmt.Errorf("unexpected session type: %T: %w", msg, sessions.ErrNoSessionFound)
+	}
+
+	return s, nil
+}
+
+var (
+	// errMCPRequestBodyTooLarge indicates that an MCP request body exceeds the
+	// route's max_request_bytes.
+	errMCPRequestBodyTooLarge = errors.New("MCP request body too large")
+	// errMCPInvalidRequest indicates an MCP request that authorization cannot
+	// be evaluated against.
+	errMCPInvalidRequest = errors.New("invalid MCP request")
+)
+
+// rejectMCPRequest denies an MCP request that authorization cannot be
+// evaluated against: 413 for an oversized body, 400 otherwise. The client has
+// not been authenticated, so it is told the cause only if the route shows error
+// details; the cause is always logged with the authorize check.
+func (a *Authorize) rejectMCPRequest(
+	ctx context.Context,
+	in *envoy_service_auth_v3.CheckRequest,
+	req *evaluator.Request,
+	err error,
+) (*envoy_service_auth_v3.CheckResponse, error) {
+	code := http.StatusBadRequest
+	if errors.Is(err, errMCPRequestBodyTooLarge) {
+		code = http.StatusRequestEntityTooLarge
+	}
+	reason := http.StatusText(code)
+	if req.Policy.ShowErrorDetails {
+		reason = err.Error()
+	}
+
+	ctx = log.WithContext(ctx, func(c zerolog.Context) zerolog.Context { return c.Err(err) })
+	a.logAuthorizeCheck(ctx, zerolog.InfoLevel, req, nil, nil)
+
+	headers := make(http.Header)
+	mcp.SetCORSHeaders(headers)
+	return a.deniedResponse(ctx, in, int32(code), reason, headers)
+}
+
+// getEvaluatorRequestFromCheckRequest returns the evaluator request for a check
+// request. For an MCP request that authorization cannot be evaluated against,
+// it returns the request along with an errMCPRequestBodyTooLarge or
+// errMCPInvalidRequest error.
+//
+// The body of a request to an MCP server route is inspected whether or not the
+// mcp runtime flag is set: Envoy buffers and forwards it for such routes
+// regardless of the flag, so skipping inspection would let mcp_tool rules in
+// the route's policy fail open.
+func (a *Authorize) getEvaluatorRequestFromCheckRequest(
+	ctx context.Context,
+	in *envoy_service_auth_v3.CheckRequest,
+) (*evaluator.Request, error) {
+	attrs := in.GetAttributes()
+	req := &evaluator.Request{
+		IsInternal:         envoyconfig.ExtAuthzContextExtensionsIsInternal(attrs.GetContextExtensions()),
+		HTTP:               evaluator.RequestHTTPFromCheckRequest(ctx, in),
+		EnvoyRouteChecksum: envoyconfig.ExtAuthzContextExtensionsRouteChecksum(attrs.GetContextExtensions()),
+		EnvoyRouteID:       envoyconfig.ExtAuthzContextExtensionsRouteID(attrs.GetContextExtensions()),
+	}
+	req.Policy = a.getMatchingPolicy(req.EnvoyRouteID)
+
+	if req.Policy.IsMCPServer() {
+		// Envoy buffers one byte past max_request_bytes, so a longer body is
+		// an oversized one it truncated.
+		body := in.GetAttributes().GetRequest().GetHttp().GetBody()
+		if uint64(len(body)) > uint64(req.Policy.MCP.Server.GetMaxRequestBytes()) {
+			return req, errMCPRequestBodyTooLarge
+		}
+
+		var err error
+		req.MCP, err = evaluator.RequestMCPFromCheckRequest(in)
+		if err != nil {
+			return req, fmt.Errorf("%w: %w", errMCPInvalidRequest, err)
+		}
+	}
+
+	return req, nil
+}
+
+func (a *Authorize) getMatchingPolicy(routeID string) *config.Policy {
+	options := a.currentConfig.Load().Options
+
+	for p := range options.GetAllPolicies() {
+		id, _ := p.RouteID()
+		if id == routeID {
+			return p
+		}
+	}
+
+	return nil
+}
+
+func (a *Authorize) withQuerierForCheckRequest(ctx context.Context) context.Context {
+	state := a.state.Load()
+	q := storage.NewQuerier(state.dataBrokerClient)
+	q = storage.NewCachingQuerier(q, storage.GlobalCache)
+	// if sync queriers are enabled, use those
+	if len(state.syncQueriers) > 0 {
+		m := map[string]storage.Querier{}
+		for recordType, sq := range state.syncQueriers {
+			m[recordType] = storage.NewFallbackQuerier(sq, q)
+		}
+		q = storage.NewTypedQuerier(q, m)
+	}
+	return storage.WithQuerier(ctx, q)
+}
+
+func getHTTPRequestFromCheckRequest(req *envoy_service_auth_v3.CheckRequest) *http.Request {
+	hattrs := req.GetAttributes().GetRequest().GetHttp()
+	u := checkrequest.GetURL(req)
+	hreq := &http.Request{
+		Method:     hattrs.GetMethod(),
+		URL:        &u,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(hattrs.GetBody())),
+		Host:       hattrs.GetHost(),
+		RequestURI: hattrs.GetPath(),
+	}
+	for k, v := range getCheckRequestHeaders(req) {
+		hreq.Header.Set(k, v)
+	}
+	return hreq
+}
+
+func getCheckRequestHeaders(req *envoy_service_auth_v3.CheckRequest) map[string]string {
+	hdrs := make(map[string]string)
+	ch := req.GetAttributes().GetRequest().GetHttp().GetHeaders()
+	for k, v := range ch {
+		hdrs[httputil.CanonicalHeaderKey(k)] = v
+	}
+	return hdrs
+}
+
+func updateSpanWithMCPInfo(span oteltrace.Span, mcp evaluator.RequestMCP) {
+	if mcp.Method == "" {
+		return
+	}
+	span.SetAttributes(attribute.String("mcp.method", mcp.Method))
+	if tc := mcp.ToolCall; tc != nil {
+		span.SetAttributes(attribute.String("mcp.tool", tc.Name))
+	}
+}
+
+// hasCookieAndBearer reports whether the request carries BOTH a Pomerium
+// session cookie AND an Authorization: Bearer header. The two are mutually
+// exclusive trust contexts (browser vs M2M).
+func hasCookieAndBearer(r *http.Request, cookieName string) bool {
+	if cookieName == "" {
+		return false
+	}
+	// Check the (cheap) Authorization header before parsing cookies: the
+	// common authenticated browser case carries a cookie but no bearer, so
+	// short-circuiting here skips cookie parsing on the hot path.
+	const prefix = "Bearer "
+	auth := r.Header.Get(httputil.HeaderAuthorization)
+	if len(auth) < len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+		return false
+	}
+	_, err := r.Cookie(cookieName)
+	return err == nil
+}

@@ -1,0 +1,383 @@
+package config
+
+import (
+	"bytes"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"fmt"
+	"net/http"
+	"net/url"
+	"slices"
+	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	oteltrace "go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/pomerium/pomerium/internal/fileutil"
+	"github.com/pomerium/pomerium/internal/hashutil"
+	"github.com/pomerium/pomerium/internal/httputil"
+	"github.com/pomerium/pomerium/internal/telemetry/metrics"
+	"github.com/pomerium/pomerium/pkg/cryptutil"
+	"github.com/pomerium/pomerium/pkg/derivecert"
+	"github.com/pomerium/pomerium/pkg/endpoints"
+	configpb "github.com/pomerium/pomerium/pkg/grpc/config"
+	"github.com/pomerium/pomerium/pkg/hpke"
+	"github.com/pomerium/pomerium/pkg/netutil"
+	"github.com/pomerium/pomerium/pkg/nullable"
+)
+
+// MetricsScrapeEndpoint defines additional metrics endpoints that would be scraped and exposed by pomerium
+type MetricsScrapeEndpoint metrics.ScrapeEndpoint
+
+// Config holds pomerium configuration options.
+type Config struct {
+	Options          *Options
+	AutoCertificates []tls.Certificate
+	EnvoyVersion     string
+
+	// DerivedCertificates are TLS certificates derived from the shared secret
+	DerivedCertificates []tls.Certificate
+	// DerivedCAPEM is a PEM-encoded certificate authority
+	// derived from the shared secret
+	DerivedCAPEM []byte
+
+	// EnvoyAdminInternalAddress is the address of the envoy admin.
+	EnvoyAdminInternalAddress netutil.InternalAddress
+	// GRPCPort is the port the gRPC server is running on.
+	GRPCPort string
+	// HTTPPort is the port the HTTP server is running on.
+	HTTPPort string
+	// OutboundPort is the port the outbound gRPC listener is running on.
+	OutboundPort string
+	// MetricsPort is the port the metrics listener is running on.
+	MetricsPort string
+	// DebugPort is the port the debug listener is running on.
+	DebugPort string
+	// ACMETLSPort is the port that handles the ACME TLS-ALPN challenge.
+	ACMETLSALPNPort string
+	// ConnectPort is the port the connect server is running on.
+	ConnectPort string
+
+	// MetricsScrapeEndpoints additional metrics endpoints to scrape and provide part of metrics
+	MetricsScrapeEndpoints []MetricsScrapeEndpoint
+
+	// ZeroClusterID is the zero cluster id, only set when in zero mode.
+	ZeroClusterID string
+	// ZeroOrganizationID is the zero organization id, only set when in zero mode.
+	ZeroOrganizationID string
+	// ZeroPseudonymizationKey is the zero key used to pseudonymize data, only set in zero mode.
+	ZeroPseudonymizationKey []byte
+}
+
+// New creates a new Config.
+func New(options *Options) *Config {
+	return &Config{
+		Options:                   options,
+		EnvoyAdminInternalAddress: *netutil.NewInternalAddress(),
+	}
+}
+
+// Clone creates a clone of the config.
+func (cfg *Config) Clone() *Config {
+	newOptions := new(Options)
+	if cfg.Options != nil {
+		*newOptions = *cfg.Options
+	}
+
+	endpoints := make([]MetricsScrapeEndpoint, len(cfg.MetricsScrapeEndpoints))
+	_ = copy(endpoints, cfg.MetricsScrapeEndpoints)
+
+	return &Config{
+		Options:          newOptions,
+		AutoCertificates: cfg.AutoCertificates,
+		EnvoyVersion:     cfg.EnvoyVersion,
+
+		EnvoyAdminInternalAddress: cfg.EnvoyAdminInternalAddress,
+		GRPCPort:                  cfg.GRPCPort,
+		HTTPPort:                  cfg.HTTPPort,
+		OutboundPort:              cfg.OutboundPort,
+		MetricsPort:               cfg.MetricsPort,
+		DebugPort:                 cfg.DebugPort,
+		ACMETLSALPNPort:           cfg.ACMETLSALPNPort,
+		ConnectPort:               cfg.ConnectPort,
+
+		MetricsScrapeEndpoints: endpoints,
+
+		DerivedCertificates: cfg.DerivedCertificates,
+		DerivedCAPEM:        cfg.DerivedCAPEM,
+	}
+}
+
+// AllCertificateAuthoritiesPEM returns all CAs as PEM bundle bytes
+func (cfg *Config) AllCertificateAuthoritiesPEM() ([]byte, error) {
+	var combined bytes.Buffer
+	if cfg.Options.CA != "" {
+		bs, err := base64.StdEncoding.DecodeString(cfg.Options.CA)
+		if err != nil {
+			return nil, err
+		}
+		_, _ = combined.Write(bs)
+		_, _ = combined.WriteRune('\n')
+	}
+
+	if cfg.Options.CAFile != "" {
+		if err := fileutil.CopyFileUpTo(&combined, cfg.Options.CAFile, 5<<20); err != nil {
+			return nil, err
+		}
+		_, _ = combined.WriteRune('\n')
+	}
+
+	if cfg.DerivedCAPEM != nil {
+		_, _ = combined.Write(cfg.DerivedCAPEM)
+		_, _ = combined.WriteRune('\n')
+	}
+
+	return combined.Bytes(), nil
+}
+
+// AllCertificates returns all the certificates in the config.
+func (cfg *Config) AllCertificates() ([]tls.Certificate, error) {
+	optionCertificates, err := cfg.Options.GetCertificates()
+	if err != nil {
+		return nil, err
+	}
+
+	var certs []tls.Certificate
+	certs = append(certs, optionCertificates...)
+	certs = append(certs, cfg.AutoCertificates...)
+	certs = append(certs, cfg.DerivedCertificates...)
+	return certs, nil
+}
+
+// Checksum returns the config checksum.
+func (cfg *Config) Checksum() uint64 {
+	return hashutil.MustHash(cfg)
+}
+
+// AllocatePorts populates
+func (cfg *Config) AllocatePorts(ports [7]string) {
+	cfg.GRPCPort = ports[0]
+	cfg.HTTPPort = ports[1]
+	cfg.OutboundPort = ports[2]
+	cfg.MetricsPort = ports[3]
+	cfg.DebugPort = ports[4]
+	cfg.ACMETLSALPNPort = ports[5]
+	cfg.ConnectPort = ports[6]
+}
+
+// GetTLSClientConfig returns TLS configuration that accounts for additional CA entries
+func (cfg *Config) GetTLSClientConfig() (*tls.Config, error) {
+	roots, err := cfg.GetCertificatePool()
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		RootCAs:    roots,
+		MinVersion: tls.VersionTLS12,
+	}, nil
+}
+
+// GenerateCatchAllCertificate generates a catch-all certificate from a CA
+// derived from the shared secret.
+func (cfg *Config) GenerateCatchAllCertificate() (*tls.Certificate, error) {
+	sharedKey, err := cfg.Options.GetSharedKey()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate cert, invalid shared key: %w", err)
+	}
+	return cryptutil.GenerateCertificate(sharedKey, "*")
+}
+
+// WillHaveCertificateForServerName returns true if there will be a certificate for the given server name.
+func (cfg *Config) WillHaveCertificateForServerName(serverName string) (bool, error) {
+	certificates, err := cfg.AllCertificates()
+	if err != nil {
+		return false, err
+	}
+
+	// first try a direct name match
+	for i := range certificates {
+		if cryptutil.MatchesServerName(&certificates[i], serverName) {
+			return true, nil
+		}
+	}
+
+	return cfg.Options.GetDeriveInternalDomain() == serverName, nil
+}
+
+// GetCertificatePool gets the certificate pool for the config.
+func (cfg *Config) GetCertificatePool() (*x509.CertPool, error) {
+	pool, err := cryptutil.GetCertPool(cfg.Options.CA, cfg.Options.CAFile)
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.Options.DeriveInternalDomainCert != nil {
+		sharedKey, err := cfg.Options.GetSharedKey()
+		if err != nil {
+			return nil, fmt.Errorf("failed to derive CA, invalid shared key: %w", err)
+		}
+
+		ca, err := derivecert.NewCA(sharedKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to derive CA: %w", err)
+		}
+
+		pem, err := ca.PEM()
+		if err != nil {
+			return nil, fmt.Errorf("failed to derive CA PEM: %w", err)
+		}
+
+		if !pool.AppendCertsFromPEM(pem.Cert) {
+			return nil, fmt.Errorf("failed to derive CA PEM, error appending to pool")
+		}
+	}
+
+	return pool, nil
+}
+
+// GetAuthenticateKeyFetcher returns a key fetcher for the authenticate service
+func (cfg *Config) GetAuthenticateKeyFetcher() (hpke.KeyFetcher, error) {
+	authenticateURL, transport, err := cfg.resolveAuthenticateURL(otel.GetTracerProvider())
+	if err != nil {
+		return nil, err
+	}
+	hpkeURL := authenticateURL.ResolveReference(&url.URL{
+		Path: endpoints.PathHPKEPublicKey,
+	}).String()
+	return hpke.NewKeyFetcher(hpkeURL, transport), nil
+}
+
+func (cfg *Config) resolveAuthenticateURL(tracerProvider oteltrace.TracerProvider) (*url.URL, http.RoundTripper, error) {
+	authenticateURL, err := cfg.Options.GetInternalAuthenticateURL()
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid authenticate service url: %w", err)
+	}
+	ok, err := cfg.WillHaveCertificateForServerName(authenticateURL.Hostname())
+	if err != nil {
+		return nil, nil, fmt.Errorf("error determining if authenticate service will have a certificate name: %w", err)
+	}
+	var transport *http.Transport
+	if ok {
+		transport, err = GetTLSClientTransport(cfg)
+		if err != nil {
+			return nil, nil, fmt.Errorf("get tls client config: %w", err)
+		}
+	} else {
+		transport = httputil.GetInsecureTransport()
+	}
+	if cfg.Options.UseProxyProtocol {
+		transport = httputil.NewLocalProxyProtocolTransport(transport)
+	}
+	return authenticateURL, otelhttp.NewTransport(transport, otelhttp.WithTracerProvider(tracerProvider)), nil
+}
+
+func getOneOf[OneOfContainer, OneOf, Value any](container OneOfContainer, _ OneOf, value Value) *Value {
+	_, ok := any(container).(OneOf)
+	if ok {
+		return new(value)
+	}
+	return nil
+}
+
+func setOneOf[OneOfContainer, OneOf, Value any](container *OneOfContainer, oneOf OneOf, value nullable.Value[Value]) error {
+	if !value.IsSet {
+		return nil
+	}
+	*container = any(oneOf).(OneOfContainer)
+	return nil
+}
+
+func setNullableDurationFromProto(dst *nullable.Value[time.Duration], src *durationpb.Duration) error {
+	if src == nil {
+		return nil
+	}
+	*dst = nullable.NewValue(true, src.AsDuration())
+	return nil
+}
+
+func setNullableDurationToProto(dst **durationpb.Duration, src nullable.Value[time.Duration]) error {
+	if !src.IsSet {
+		return nil
+	}
+	*dst = durationpb.New(src.Value)
+	return nil
+}
+
+func setNullableSliceOfByteFromProto(dst *nullable.Value[[]byte], src []byte) error {
+	if src == nil {
+		return nil
+	}
+	*dst = nullable.NewValue(true, slices.Clone(src))
+	return nil
+}
+
+func setNullableSliceOfByteToProto(dst *[]byte, src nullable.Value[[]byte]) error {
+	if !src.IsSet {
+		return nil
+	}
+	*dst = slices.Clone(src.Value)
+	return nil
+}
+
+func setNullableStringListFromProto[T any, TPtr interface {
+	*T
+	GetValues() []string
+}](dst *nullable.Value[[]string], src TPtr) error {
+	if src == nil {
+		return nil
+	}
+	*dst = nullable.NewValue(true, src.GetValues())
+	return nil
+}
+
+func setNullableStringListToProto[T any, TPtr interface {
+	*T
+	GetValues() []string
+}](dst *TPtr, src nullable.Value[[]string]) error {
+	if !src.IsSet {
+		return nil
+	}
+	*dst = new(T)
+	if obj, ok := any(*dst).(*configpb.EnterpriseSettings_StringList); ok {
+		obj.Values = slices.Clone(src.Value)
+	}
+	if obj, ok := any(*dst).(*configpb.Settings_StringList); ok {
+		obj.Values = slices.Clone(src.Value)
+	}
+	if obj, ok := any(*dst).(*configpb.Route_StringList); ok {
+		obj.Values = slices.Clone(src.Value)
+	}
+	return nil
+}
+
+func setNullableStructFromProto(dst *nullable.Value[map[string]any], src *structpb.Struct) error {
+	if src == nil {
+		return nil
+	}
+	*dst = nullable.NewValue(true, src.AsMap())
+	return nil
+}
+
+func setNullableStructToProto(dst **structpb.Struct, src nullable.Value[map[string]any]) error {
+	if !src.IsSet {
+		return nil
+	}
+	v, err := structpb.NewValue(src.Value)
+	if err != nil {
+		return err
+	}
+	*dst = v.GetStructValue()
+	return nil
+}
+
+func setSliceOfByteToProto(dst *[]byte, src nullable.Value[[]byte]) error {
+	if !src.IsSet {
+		return nil
+	}
+	*dst = slices.Clone(src.Value)
+	return nil
+}

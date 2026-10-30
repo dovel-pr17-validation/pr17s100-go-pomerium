@@ -1,0 +1,33 @@
+name: govulncheck
+permissions:
+  contents: read
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - "**/go.mod"
+      - "**/go.sum"
+      - go.work
+      - go.work.sum
+      - Makefile
+      - .github/workflows/govulncheck.yaml
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: .tool-versions
+          cache: false
+
+      - run: make deps-build
+
+      - run: make govulncheck

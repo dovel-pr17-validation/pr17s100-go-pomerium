@@ -1,0 +1,150 @@
+package pebbleutil
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"testing"
+
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/pomerium/pomerium/pkg/iterutil"
+)
+
+func TestSecureFSFileAndDirPerms(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	dbDir := filepath.Join(dir, "db")
+	db, err := Open(dbDir, nil)
+	if err != nil {
+		t.Fatalf("open pebble: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	wo := &pebble.WriteOptions{Sync: true}
+	val := bytes.Repeat([]byte{'v'}, 4096)
+	for i := range 200 {
+		k := fmt.Appendf(nil, "k%06d", i)
+		if err := db.Set(k, val, wo); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	var foundFile bool
+	err = filepath.Walk(dbDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		mode := info.Mode().Perm()
+		if info.IsDir() {
+			if mode != 0o700 {
+				t.Errorf("dir %s mode = %o, want 0700", path, mode)
+			}
+			return nil
+		}
+		base := filepath.Base(path)
+		if base == "LOCK" {
+			// Pebble seems to manage LOCK file separately
+			return nil
+		}
+		foundFile = true
+		if mode != 0o600 {
+			t.Errorf("file %s mode = %o, want 0600", path, mode)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if !foundFile {
+		t.Fatalf("no files found in pebble dir; test invalid")
+	}
+}
+
+func TestSecureFS(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ReuseForWrite", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		oldname := filepath.Join(dir, "oldname")
+		newname := filepath.Join(dir, "newname")
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "oldname"), []byte("example"), 0o666))
+
+		fs := NewSecureFS(vfs.Default)
+		f, err := fs.ReuseForWrite(oldname, newname, vfs.WriteCategoryUnspecified)
+		if assert.NoError(t, err) {
+			f.Close()
+		}
+	})
+}
+
+func TestMustOpenMemoryUnchanged(t *testing.T) {
+	t.Parallel()
+	db := MustOpenMemory(nil)
+	t.Cleanup(func() { _ = db.Close() })
+	wo := &pebble.WriteOptions{Sync: true}
+	if err := db.Set([]byte("k"), []byte("v"), wo); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+}
+
+func TestIterate(t *testing.T) {
+	t.Parallel()
+
+	db := MustOpenMemory(nil)
+	require.NoError(t, db.Set([]byte{0x01}, []byte{0xa1}, nil))
+	require.NoError(t, db.Set([]byte{0x02}, []byte{0xa2}, nil))
+	require.NoError(t, db.Set([]byte{0x03}, []byte{0xa3}, nil))
+	require.NoError(t, db.Set([]byte{0x04}, []byte{0xa4}, nil))
+	require.NoError(t, db.Set([]byte{0x05}, []byte{0xa5}, nil))
+
+	opts := new(pebble.IterOptions)
+	opts.LowerBound = []byte{0x02}
+	opts.UpperBound = []byte{0x04}
+	vs, err := iterutil.CollectWithError(Iterate(db, opts, func(it *pebble.Iterator) ([]byte, error) {
+		v, err := it.ValueAndErr()
+		if err != nil {
+			return nil, err
+		}
+		return slices.Clone(v), nil
+	}))
+	assert.NoError(t, err)
+	assert.Equal(t, [][]byte{{0xa2}, {0xa3}}, vs)
+}
+
+func TestIterateReversed(t *testing.T) {
+	t.Parallel()
+
+	db := MustOpenMemory(nil)
+	require.NoError(t, db.Set([]byte{0x01}, []byte{0xa1}, nil))
+	require.NoError(t, db.Set([]byte{0x02}, []byte{0xa2}, nil))
+	require.NoError(t, db.Set([]byte{0x03}, []byte{0xa3}, nil))
+	require.NoError(t, db.Set([]byte{0x04}, []byte{0xa4}, nil))
+	require.NoError(t, db.Set([]byte{0x05}, []byte{0xa5}, nil))
+
+	opts := new(pebble.IterOptions)
+	opts.LowerBound = []byte{0x02}
+	opts.UpperBound = []byte{0x04}
+	vs, err := iterutil.CollectWithError(IterateReversed(db, opts, func(it *pebble.Iterator) ([]byte, error) {
+		v, err := it.ValueAndErr()
+		if err != nil {
+			return nil, err
+		}
+		return slices.Clone(v), nil
+	}))
+	assert.NoError(t, err)
+	assert.Equal(t, [][]byte{{0xa3}, {0xa2}}, vs)
+}

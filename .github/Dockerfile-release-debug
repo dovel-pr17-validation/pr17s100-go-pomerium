@@ -1,0 +1,26 @@
+FROM debian:trixie-20261020-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+ARG DEBIAN_FRONTEND=noninteractive
+ENV AUTOCERT_DIR=/data/autocert
+WORKDIR /pomerium
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        dnsutils \
+        iproute2 \
+        iputils-ping \
+        jq \
+        lsof \
+        netcat-openbsd \
+        openssl \
+        procps \
+        strace \
+        traceroute \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419+deb13u1' \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+COPY pomerium /bin/
+RUN touch /pomerium/config.yaml
+ENTRYPOINT [ "/bin/pomerium" ]
+CMD ["--config","/pomerium/config.yaml"]

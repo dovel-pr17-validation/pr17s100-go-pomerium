@@ -1,0 +1,566 @@
+package e2e
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"strings"
+	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/pomerium/pomerium/config"
+	mcphandler "github.com/pomerium/pomerium/internal/mcp"
+	"github.com/pomerium/pomerium/internal/testenv"
+	"github.com/pomerium/pomerium/internal/testenv/scenarios"
+	"github.com/pomerium/pomerium/internal/testenv/snippets"
+	"github.com/pomerium/pomerium/internal/testenv/upstreams"
+	"github.com/pomerium/pomerium/pkg/cryptutil"
+)
+
+// TestMCPConformance tests OAuth 2.1 conformance for MCP authorization server.
+// These tests verify security-critical behavior that maps to the MCP conformance suite:
+// https://github.com/modelcontextprotocol/conformance
+func TestMCPConformance(t *testing.T) {
+	for _, mode := range registrationModes {
+		t.Run(mode.name, func(t *testing.T) {
+			runMCPConformance(t, mode)
+		})
+	}
+}
+
+func runMCPConformance(t *testing.T, mode registrationMode) {
+	env := testenv.New(t)
+
+	env.Add(testenv.ModifierFunc(func(_ context.Context, cfg *config.Config) {
+		enableMCP(cfg, mode.dcr)
+		cfg.Options.MCPAllowedClientIDDomains = []string{"*.localhost.pomerium.io"}
+		if !mode.dcr {
+			// CIMD fetches reach test servers on localhost.
+			cfg.Options.InsecureSkipMCPMetadataSSRFCheck = true
+		}
+	}))
+
+	idp := scenarios.NewIDP([]*scenarios.User{
+		{Email: "user@example.com"},
+	})
+	env.Add(idp)
+
+	mcpServer := mcp.NewServer(&mcp.Implementation{
+		Name:    "conformance-test-server",
+		Version: "1.0.0",
+	}, nil)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "ping",
+		Description: "Returns pong",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "pong"}},
+		}, nil, nil
+	})
+
+	serverUpstream := upstreams.HTTP(nil, upstreams.WithDisplayName("MCP Conformance Server"))
+	serverHandler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
+		return mcpServer
+	}, nil)
+	serverUpstream.Handle("/", serverHandler.ServeHTTP)
+
+	serverRoute := serverUpstream.Route().
+		From(env.SubdomainURL("mcp-conformance-" + mode.name)).
+		Policy(func(p *config.Policy) {
+			p.AllowedDomains = []string{"example.com"}
+			p.MCP = &config.MCP{Server: &config.MCPServer{}}
+		})
+	env.AddUpstream(serverUpstream)
+
+	// In CIMD mode clients register by hosting a metadata document on a
+	// publicly accessible upstream rather than via the /register endpoint.
+	var clientMetadataUpstream upstreams.HTTPUpstream
+	var clientMetadataBaseURL func() string
+	if !mode.dcr {
+		clientMetadataUpstream = upstreams.HTTP(nil, upstreams.WithDisplayName("Client Metadata Server"))
+		route := clientMetadataUpstream.Route().
+			From(env.SubdomainURL("client-metadata-" + mode.name)).
+			PPL(`- allow:
+    or:
+      - accept: true`)
+		env.AddUpstream(clientMetadataUpstream)
+		clientMetadataBaseURL = func() string { return route.URL().Value() }
+	}
+
+	env.Start()
+	snippets.WaitStartupComplete(env)
+
+	ctx := env.Context()
+	mcpServerURL := serverRoute.URL().Value()
+	parsedURL, err := url.Parse(mcpServerURL)
+	require.NoError(t, err)
+
+	baseHTTPClient := func() *http.Client {
+		c := upstreams.NewHTTPClient(env.ServerCAs(), &upstreams.RequestOptions{})
+		c.Jar, _ = cookiejar.New(nil)
+		c.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		return c
+	}
+
+	// Fetch AS metadata once for all subtests
+	asMetadataURL := "https://" + parsedURL.Host + mcphandler.WellKnownAuthorizationServerEndpoint
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, asMetadataURL, nil)
+	require.NoError(t, err)
+	resp, err := baseHTTPClient().Do(req)
+	require.NoError(t, err)
+	var asMetadata mcphandler.AuthorizationServerMetadata
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&asMetadata))
+	resp.Body.Close()
+
+	// When DCR is disabled the registration_endpoint MUST NOT be advertised,
+	// while CIMD support remains advertised.
+	if mode.dcr {
+		require.NotEmpty(t, asMetadata.RegistrationEndpoint, "expected registration_endpoint when DCR enabled")
+	} else {
+		require.Empty(t, asMetadata.RegistrationEndpoint, "registration_endpoint must not be advertised when DCR disabled")
+	}
+
+	const redirectURI = "http://localhost:8080/callback"
+
+	// registerClient obtains a client per the active registration mode.
+	var registerClient clientRegistrar
+	if mode.dcr {
+		registerClient = newDCRRegistrar(ctx, &asMetadata, baseHTTPClient, redirectURI)
+	} else {
+		registerClient = newCIMDRegistrar(clientMetadataUpstream, clientMetadataBaseURL(), redirectURI)
+	}
+
+	// Helper: get authorization code via full auth flow
+	getAuthCode := func(t *testing.T, clientID, codeVerifier string) string {
+		t.Helper()
+		codeChallenge := generateS256Challenge(codeVerifier)
+		state := cryptutil.NewRandomStringN(32)
+
+		authParams := url.Values{
+			"response_type":         {"code"},
+			"client_id":             {clientID},
+			"redirect_uri":          {redirectURI},
+			"state":                 {state},
+			"code_challenge":        {codeChallenge},
+			"code_challenge_method": {"S256"},
+		}
+
+		authURL := asMetadata.AuthorizationEndpoint + "?" + authParams.Encode()
+		authClient := upstreams.NewHTTPClient(env.ServerCAs(), &upstreams.RequestOptions{})
+		authClient.Jar, _ = cookiejar.New(nil)
+		authClient.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
+			if strings.HasPrefix(req.URL.String(), redirectURI) {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, authURL, nil)
+		require.NoError(t, err)
+		resp, err := upstreams.AuthenticateFlow(ctx, authClient, req, "user@example.com", false)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		code, _, _ := parseCallbackParams(t, resp.Header.Get("Location"))
+		require.NotEmpty(t, code)
+		return code
+	}
+
+	// Helper: make token request and return response
+	doTokenRequest := func(t *testing.T, params url.Values, basicAuth *[2]string) (*http.Response, map[string]any) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, asMetadata.TokenEndpoint, strings.NewReader(params.Encode()))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if basicAuth != nil {
+			credentials := base64.StdEncoding.EncodeToString([]byte(basicAuth[0] + ":" + basicAuth[1]))
+			req.Header.Set("Authorization", "Basic "+credentials)
+		}
+		resp, err := baseHTTPClient().Do(req)
+		require.NoError(t, err)
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		var result map[string]any
+		_ = json.Unmarshal(body, &result)
+		t.Logf("Token response: status=%d body=%s", resp.StatusCode, string(body))
+		return resp, result
+	}
+
+	// ============================================================================
+	// Test #1: Token Endpoint Authentication Methods (client_secret_basic)
+	// Conformance: https://github.com/modelcontextprotocol/conformance/blob/main/src/scenarios/client/auth/token-endpoint-auth.ts
+	//
+	// Confidential clients only — CIMD clients are public, so this is skipped in
+	// CIMD mode.
+	// ============================================================================
+	if mode.confidential {
+		t.Run("token_endpoint_auth_client_secret_basic", func(t *testing.T) {
+			clientID, clientSecret := registerClient(t, "client_secret_basic")
+			codeVerifier := cryptutil.NewRandomStringN(64)
+			authCode := getAuthCode(t, clientID, codeVerifier)
+
+			t.Run("valid_basic_auth_succeeds", func(t *testing.T) {
+				params := url.Values{
+					"grant_type":    {"authorization_code"},
+					"code":          {authCode},
+					"redirect_uri":  {redirectURI},
+					"client_id":     {clientID},
+					"code_verifier": {codeVerifier},
+				}
+				resp, result := doTokenRequest(t, params, &[2]string{clientID, clientSecret})
+				assert.Equal(t, http.StatusOK, resp.StatusCode)
+				assert.NotEmpty(t, result["access_token"])
+				assert.Equal(t, "Bearer", result["token_type"])
+			})
+
+			t.Run("missing_basic_auth_fails", func(t *testing.T) {
+				// Need a new auth code since the previous one was consumed
+				newCodeVerifier := cryptutil.NewRandomStringN(64)
+				newAuthCode := getAuthCode(t, clientID, newCodeVerifier)
+
+				params := url.Values{
+					"grant_type":    {"authorization_code"},
+					"code":          {newAuthCode},
+					"redirect_uri":  {redirectURI},
+					"client_id":     {clientID},
+					"code_verifier": {newCodeVerifier},
+				}
+				resp, result := doTokenRequest(t, params, nil) // No auth header
+				assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+				assert.Equal(t, "invalid_client", result["error"])
+			})
+
+			t.Run("wrong_secret_fails", func(t *testing.T) {
+				newCodeVerifier := cryptutil.NewRandomStringN(64)
+				newAuthCode := getAuthCode(t, clientID, newCodeVerifier)
+
+				params := url.Values{
+					"grant_type":    {"authorization_code"},
+					"code":          {newAuthCode},
+					"redirect_uri":  {redirectURI},
+					"client_id":     {clientID},
+					"code_verifier": {newCodeVerifier},
+				}
+				resp, result := doTokenRequest(t, params, &[2]string{clientID, "wrong-secret"})
+				// OAuth 2.1 3.2.4: the client authenticated via the Authorization
+				// header, so the failure MUST be a 401 carrying WWW-Authenticate.
+				assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+				assert.Equal(t, "invalid_client", result["error"])
+				assert.Equal(t, `Basic realm="pomerium"`, resp.Header.Get("WWW-Authenticate"))
+			})
+		})
+	}
+
+	// ============================================================================
+	// Test #1b: Unknown client_id at the token endpoint
+	//
+	// Reproduces what an MCP client sees after the databroker storage is cleared:
+	// it still holds a persisted registration, but the authorization server no
+	// longer knows the client. OAuth 2.1 3.2.3.1 requires invalid_client, which is
+	// the signal MCP clients use to discard the stale registration and register
+	// again. Anything else leaves the client retrying a dead client_id forever.
+	// ============================================================================
+	t.Run("unknown_client_id_fails_with_invalid_client", func(t *testing.T) {
+		params := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {"stale-refresh-token"},
+			"client_id":     {"e6a1f0b2-6d2d-4c53-9a3f-2b7a4c1d8e90"},
+		}
+		resp, result := doTokenRequest(t, params, nil)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "invalid_client", result["error"])
+	})
+
+	// ============================================================================
+	// Test #2: PKCE Code Verifier Validation
+	// MCP Authorization Spec (2025-11-25):
+	//   "MCP clients MUST implement PKCE according to OAuth 2.1 Section 7.5.2"
+	//   "MCP clients MUST use the S256 code challenge method when technically capable"
+	// Conformance: https://github.com/modelcontextprotocol/conformance/blob/main/src/scenarios/client/auth/pkce-validation.ts
+	// ============================================================================
+	t.Run("pkce_code_verifier_validation", func(t *testing.T) {
+		clientID, _ := registerClient(t, "none")
+
+		t.Run("wrong_verifier_fails", func(t *testing.T) {
+			codeVerifier := cryptutil.NewRandomStringN(64)
+			authCode := getAuthCode(t, clientID, codeVerifier)
+
+			params := url.Values{
+				"grant_type":    {"authorization_code"},
+				"code":          {authCode},
+				"redirect_uri":  {redirectURI},
+				"client_id":     {clientID},
+				"code_verifier": {"completely-different-verifier-that-does-not-match"},
+			}
+			resp, result := doTokenRequest(t, params, nil)
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.Equal(t, "invalid_grant", result["error"])
+		})
+
+		t.Run("missing_verifier_fails", func(t *testing.T) {
+			codeVerifier := cryptutil.NewRandomStringN(64)
+			authCode := getAuthCode(t, clientID, codeVerifier)
+
+			params := url.Values{
+				"grant_type":   {"authorization_code"},
+				"code":         {authCode},
+				"redirect_uri": {redirectURI},
+				"client_id":    {clientID},
+				// code_verifier intentionally omitted
+			}
+			resp, result := doTokenRequest(t, params, nil)
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.Equal(t, "invalid_grant", result["error"])
+		})
+
+		t.Run("empty_verifier_fails", func(t *testing.T) {
+			codeVerifier := cryptutil.NewRandomStringN(64)
+			authCode := getAuthCode(t, clientID, codeVerifier)
+
+			params := url.Values{
+				"grant_type":    {"authorization_code"},
+				"code":          {authCode},
+				"redirect_uri":  {redirectURI},
+				"client_id":     {clientID},
+				"code_verifier": {""},
+			}
+			resp, result := doTokenRequest(t, params, nil)
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.Equal(t, "invalid_grant", result["error"])
+		})
+	})
+
+	// ============================================================================
+	// Test #3: Authorization Code Replay Protection
+	// MCP Authorization Spec (2025-11-25), referencing OAuth 2.1 Section 4.1.3:
+	//   Authorization codes MUST be one-time use. If an authorization code is
+	//   used more than once, the authorization server MUST deny the request.
+	// ============================================================================
+	t.Run("authorization_code_replay_protection", func(t *testing.T) {
+		clientID, _ := registerClient(t, "none")
+
+		t.Run("code_reuse_fails", func(t *testing.T) {
+			codeVerifier := cryptutil.NewRandomStringN(64)
+			authCode := getAuthCode(t, clientID, codeVerifier)
+
+			params := url.Values{
+				"grant_type":    {"authorization_code"},
+				"code":          {authCode},
+				"redirect_uri":  {redirectURI},
+				"client_id":     {clientID},
+				"code_verifier": {codeVerifier},
+			}
+
+			// First use should succeed
+			resp1, result1 := doTokenRequest(t, params, nil)
+			assert.Equal(t, http.StatusOK, resp1.StatusCode)
+			assert.NotEmpty(t, result1["access_token"])
+
+			// Second use of same code should fail
+			resp2, result2 := doTokenRequest(t, params, nil)
+			assert.Equal(t, http.StatusBadRequest, resp2.StatusCode)
+			assert.Equal(t, "invalid_grant", result2["error"])
+		})
+
+		t.Run("code_for_different_client_fails", func(t *testing.T) {
+			// Register two clients
+			client1ID, _ := registerClient(t, "none")
+			client2ID, _ := registerClient(t, "none")
+
+			// Get code for client1
+			codeVerifier := cryptutil.NewRandomStringN(64)
+			authCode := getAuthCode(t, client1ID, codeVerifier)
+
+			// Try to use it with client2
+			params := url.Values{
+				"grant_type":    {"authorization_code"},
+				"code":          {authCode},
+				"redirect_uri":  {redirectURI},
+				"client_id":     {client2ID}, // Different client!
+				"code_verifier": {codeVerifier},
+			}
+			resp, result := doTokenRequest(t, params, nil)
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.Equal(t, "invalid_grant", result["error"])
+		})
+	})
+
+	// ============================================================================
+	// Test #4: Refresh Token Security
+	// MCP Authorization Spec (2025-11-25):
+	//   "Clients and servers MUST implement secure token storage and follow OAuth
+	//    best practices, as outlined in OAuth 2.1, Section 7.1."
+	//   "For public clients, authorization servers MUST rotate refresh tokens as
+	//    described in OAuth 2.1 Section 4.3.1"
+	// ============================================================================
+	t.Run("refresh_token_security", func(t *testing.T) {
+		clientID, _ := registerClient(t, "none")
+		codeVerifier := cryptutil.NewRandomStringN(64)
+		authCode := getAuthCode(t, clientID, codeVerifier)
+
+		// Get initial tokens
+		params := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {authCode},
+			"redirect_uri":  {redirectURI},
+			"client_id":     {clientID},
+			"code_verifier": {codeVerifier},
+		}
+		resp, result := doTokenRequest(t, params, nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		refreshToken := result["refresh_token"].(string)
+		require.NotEmpty(t, refreshToken)
+
+		t.Run("valid_refresh_succeeds", func(t *testing.T) {
+			params := url.Values{
+				"grant_type":    {"refresh_token"},
+				"refresh_token": {refreshToken},
+				"client_id":     {clientID},
+			}
+			resp, result := doTokenRequest(t, params, nil)
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+			assert.NotEmpty(t, result["access_token"])
+			assert.NotEmpty(t, result["refresh_token"])
+			// Store rotated token for next test
+			refreshToken = result["refresh_token"].(string)
+		})
+
+		t.Run("revoked_refresh_token_fails", func(t *testing.T) {
+			// Use the current refresh token to rotate it
+			params := url.Values{
+				"grant_type":    {"refresh_token"},
+				"refresh_token": {refreshToken},
+				"client_id":     {clientID},
+			}
+			resp1, result1 := doTokenRequest(t, params, nil)
+			require.Equal(t, http.StatusOK, resp1.StatusCode)
+			oldToken := refreshToken
+			refreshToken = result1["refresh_token"].(string) // Get new rotated token
+
+			// Now try to use the old (revoked) token
+			params["refresh_token"] = []string{oldToken}
+			resp2, result2 := doTokenRequest(t, params, nil)
+			assert.Equal(t, http.StatusBadRequest, resp2.StatusCode)
+			assert.Equal(t, "invalid_grant", result2["error"])
+		})
+
+		t.Run("refresh_token_for_different_client_fails", func(t *testing.T) {
+			// Get a fresh refresh token for client1
+			client1ID, _ := registerClient(t, "none")
+			verifier := cryptutil.NewRandomStringN(64)
+			code := getAuthCode(t, client1ID, verifier)
+			params := url.Values{
+				"grant_type":    {"authorization_code"},
+				"code":          {code},
+				"redirect_uri":  {redirectURI},
+				"client_id":     {client1ID},
+				"code_verifier": {verifier},
+			}
+			resp, result := doTokenRequest(t, params, nil)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			client1RefreshToken := result["refresh_token"].(string)
+
+			// Register a different client
+			client2ID, _ := registerClient(t, "none")
+
+			// Try to use client1's refresh token with client2
+			params = url.Values{
+				"grant_type":    {"refresh_token"},
+				"refresh_token": {client1RefreshToken},
+				"client_id":     {client2ID},
+			}
+			resp, result = doTokenRequest(t, params, nil)
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.Equal(t, "invalid_grant", result["error"])
+		})
+
+		t.Run("malformed_refresh_token_fails", func(t *testing.T) {
+			params := url.Values{
+				"grant_type":    {"refresh_token"},
+				"refresh_token": {"not-a-valid-refresh-token-at-all"},
+				"client_id":     {clientID},
+			}
+			resp, result := doTokenRequest(t, params, nil)
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.Equal(t, "invalid_grant", result["error"])
+		})
+	})
+
+	// ============================================================================
+	// Test #5: Access Token Validation
+	// MCP Authorization Spec (2025-11-25):
+	//   "MCP servers MUST validate access tokens as described in OAuth 2.1 Section 5.2"
+	//   "MCP servers MUST validate that access tokens were issued specifically for
+	//    them as the intended audience"
+	//   "Invalid or expired tokens MUST receive a HTTP 401 response"
+	// ============================================================================
+	t.Run("access_token_validation", func(t *testing.T) {
+		t.Run("missing_token_returns_401_with_www_authenticate", func(t *testing.T) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, mcpServerURL, nil)
+			require.NoError(t, err)
+			resp, err := baseHTTPClient().Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+			wwwAuth := resp.Header.Get("WWW-Authenticate")
+			assert.Contains(t, wwwAuth, "Bearer")
+			assert.Contains(t, wwwAuth, "resource_metadata")
+		})
+
+		t.Run("invalid_token_returns_401", func(t *testing.T) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, mcpServerURL, nil)
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer invalid-garbage-token")
+			resp, err := baseHTTPClient().Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+		})
+
+		t.Run("valid_token_succeeds", func(t *testing.T) {
+			// Get a valid token
+			clientID, _ := registerClient(t, "none")
+			codeVerifier := cryptutil.NewRandomStringN(64)
+			authCode := getAuthCode(t, clientID, codeVerifier)
+			params := url.Values{
+				"grant_type":    {"authorization_code"},
+				"code":          {authCode},
+				"redirect_uri":  {redirectURI},
+				"client_id":     {clientID},
+				"code_verifier": {codeVerifier},
+			}
+			_, result := doTokenRequest(t, params, nil)
+			accessToken := result["access_token"].(string)
+
+			// Use it to connect to MCP server
+			mcpClient := mcp.NewClient(&mcp.Implementation{
+				Name:    "conformance-client",
+				Version: "1.0.0",
+			}, nil)
+			httpClient := upstreams.NewHTTPClient(env.ServerCAs(), &upstreams.RequestOptions{})
+			httpClient.Transport = &tokenTransport{base: httpClient.Transport, token: accessToken}
+
+			session, err := mcpClient.Connect(ctx, &mcp.StreamableClientTransport{
+				Endpoint:   mcpServerURL,
+				HTTPClient: httpClient,
+			}, nil)
+			require.NoError(t, err)
+			defer session.Close()
+
+			result2, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "ping"})
+			require.NoError(t, err)
+			require.NotEmpty(t, result2.Content)
+		})
+	})
+}

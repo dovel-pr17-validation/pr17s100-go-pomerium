@@ -1,0 +1,27 @@
+{
+  "name": "pomerium-e2e-acceptance",
+  "version": "1.0.0",
+  "description": "E2E acceptance tests for Pomerium using Playwright",
+  "private": true,
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:debug": "playwright test --debug",
+    "test:ui": "playwright test --ui",
+    "test:authn": "playwright test tests/authn/",
+    "test:authz": "playwright test tests/authz/",
+    "test:headers": "playwright test tests/headers/",
+    "report": "playwright show-report ../artifacts/playwright/report",
+    "install:browsers": "playwright install chromium",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "@types/node": "^26.6.5",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "packageManager": "npm@10.9.4"
+}

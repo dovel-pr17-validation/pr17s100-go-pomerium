@@ -1,0 +1,141 @@
+version: 2
+updates:
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 50
+    groups:
+      docker:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: "docker"
+    directory: "/.github/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 50
+    groups:
+      docker:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 50
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 50
+    groups:
+      go:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "go.opentelemetry.io/*"
+          - "github.com/exaring/otelpgx"
+          - "charm.land/*"
+          - "github.com/charmbracelet/*"
+          - "github.com/muesli/*"
+          - "github.com/mattn/go-runewidth"
+          - "github.com/lucasb-eyer/go-colorful"
+          - "github.com/rivo/uniseg"
+          - "github.com/aymanbagabas/go-osc52/*"
+          - "github.com/xo/terminfo"
+          - "github.com/atotto/clipboard"
+          - "github.com/sahilm/fuzzy"
+          - "github.com/creack/pty"
+      otel:
+        patterns:
+          - "go.opentelemetry.io/*"
+          - "github.com/exaring/otelpgx"
+      tui:
+        patterns:
+          - "charm.land/*"
+          - "github.com/charmbracelet/*"
+          - "github.com/muesli/*"
+          - "github.com/mattn/go-runewidth"
+          - "github.com/lucasb-eyer/go-colorful"
+          - "github.com/rivo/uniseg"
+          - "github.com/aymanbagabas/go-osc52/*"
+          - "github.com/xo/terminfo"
+          - "github.com/atotto/clipboard"
+          - "github.com/sahilm/fuzzy"
+          - "github.com/creack/pty"
+  - package-ecosystem: "gomod"
+    directory: "/pkg/grpc/config/"
+    schedule:
+      interval: "monthly"
+    groups:
+      go-grpc-config:
+        patterns:
+          - "*"
+  - package-ecosystem: "gomod"
+    directory: "/pkg/grpc/databroker/"
+    schedule:
+      interval: "monthly"
+    groups:
+      go-grpc-databroker:
+        patterns:
+          - "*"
+  - package-ecosystem: "npm"
+    directory: "/ui"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 50
+    groups:
+      npm:
+        patterns:
+          - "*"
+  - package-ecosystem: "npm"
+    directory: "/internal/acceptance/browser"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 50
+    groups:
+      npm:
+        patterns:
+          - "*"
+  - package-ecosystem: "npm"
+    directory: "/internal/acceptance/ws-server"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 50
+    groups:
+      npm:
+        patterns:
+          - "*"
+  # npm workspace for the container-based e2e suites (mcp, downstream-mtls);
+  # one lockfile at the workspace root covers every member.
+  - package-ecosystem: "npm"
+    directory: "/internal/acceptance/suites"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 50
+    groups:
+      npm:
+        patterns:
+          - "*"
+  # In-container MCP server for the mcp suite - a separate npm project outside
+  # the suites workspace (its own lockfile), so it needs its own entry. This is
+  # where the fast-uri / ip-address advisories lived.
+  - package-ecosystem: "npm"
+    directory: "/internal/acceptance/suites/mcp/upstream"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 50
+    groups:
+      npm:
+        patterns:
+          - "*"
